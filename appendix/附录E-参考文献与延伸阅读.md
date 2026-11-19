@@ -71,6 +71,18 @@
 | *DeepGEMM* (deepseek-ai, 2025) | TMA multicast 的 FP8 grouped GEMM:MoE 专家计算的 kernel 标杆 | Ch12 §12.3/12.4 |
 | *DeepEP* (deepseek-ai, 2025) | 两种 all-to-all 模式(normal 高吞吐 / low-latency 低延迟)的开源实现 | Ch13 §13.2/13.3 |
 
+### Agent 与自我改进(附录 H)
+
+| 论文 | 一句话 | 书中对应 |
+|---|---|---|
+| Yao et al., *ReAct: Synergizing Reasoning and Acting in Language Models* (2022) | 思考-行动(tool call)交替:agent 工具循环的最小结构 | 附录 H §H.1.2 |
+| Shinn et al., *Reflexion: Verbal Reinforcement Learning for Self-Improving Language Agents* (2023) | 执行→反思→重试:agent 级自我改进的负载形态(近似重复 prompt,前缀缓存黄金负载) | 附录 H §H.3.1 |
+| Madaan et al., *Self-Refine: Iterative Refinement with Self-Feedback* (2023) | 生成→自评→精修:每任务 2-3× 调用量;自评 = 长输入短输出 | 附录 H §H.3 |
+| Zhou et al., *STaR: Bootstrapping Reasoning With Reasoning* (2023) | 自训练最简管线:生成→验证筛选→回灌;rollout serving 的起点 | 附录 H §H.4.1 |
+| Yuan et al., *Self-Rewarding Language Models* (2024) | policy 兼任 judge:无额外模型,调用量翻倍,同池资源画像冲突 | 附录 H §H.4.4 |
+| *DeepSeekMath* (2024,提出 GRPO) | group 相对策略优化:同 prompt G rollouts = 前缀分叉 G 叉 | 附录 H §H.4.2/§H.4.5 |
+| *DAPO* (2025) | 开源 RL 后训练系统口径:rollout 规模与异步管线 | 附录 H §H.4.3 |
+
 ## E.2 文档与官方资料(必读级)
 
 - **vLLM 官方文档** + v1 架构设计文档(`docs.vllm.ai`;v1 的 EngineCore/单进程重构、CUDA graph 分桶、调度器 token 预算行为都从这里核对)——Ch4 版本差异、Ch5 块表、Ch6 调度的核对源。
@@ -80,6 +92,7 @@
 - **DCGM 文档**:XID 码表、DIAG、主机/卡级监控——Ch21 卡级故障与 Ch22 监控指纹的码表。
 - **NCCL 文档**:环境变量全集(附录 C 的 30 项从这里核对默认值)、拓扑识别、SHARP 支持矩阵。
 - **各框架 release notes**:vLLM v0→v1 的行为变化、SGLang 调度行为、TRT-LLM 参数——**写 Ch4 时逐条核对过,定稿前再核对一遍**(附录 G 的复核项)。
+- **Agent 框架与 RL 后训练官方文档**:LangGraph / OpenAI Agents SDK / CrewAI / AG2 / LlamaIndex Workflows(附录 H §H.1.1 生态表)+ verl / OpenRLHF / TRL / SkyRL / NeMo-RL(附录 H §H.4.3 框架表,含 NeMo-RL 官方 blog 的步时分解与权重传输 10× 优化、SkyRL 的 async in-flight 权重更新与 staleness bound)——**均为 [官方, 2026-11, 未实机核验]**(附录 G §G.2)。
 
 ## E.3 代码仓库(走读入口)
 
@@ -95,6 +108,12 @@
 | `ai-dynamo/benchmaker` (GenAI-Perf) | LLM 压测负载生成 | Ch24-27 |
 | `microsoft/llm-perf` | 跨引擎压测对比(辅助口径) | Ch2 §压测口径 |
 | `kvcache-ai/Mooncake` | KV 池 + 传输层设计 | Ch9 |
+| `langchain-ai/langgraph` | 图编排的状态/checkpoint 语义(负载发生视角,非源码走读) | 附录 H §H.1.1 |
+| `openai/openai-agents-python` | Agents SDK:session/handoff 的 OpenAI 兼容调用路径 | 附录 H §H.1.1 |
+| `volcengine/verl` | RL 后训练的 vLLM rollout 集成(HybridFlow) | 附录 H §H.4.3 |
+| `OpenRLHF/OpenRLHF` / `huggingface/trl` | 分离式 rollout actor / 训练侧算法库口径 | 附录 H §H.4.3 |
+| `NovaSky-AI/SkyRL` | 全异步 RL:in-flight 权重更新 + staleness manager(agent RL 主战场) | 附录 H §H.4.3 |
+| `NVIDIA-NeMo/RL` | NeMo-RL:Ray 编排 + Megatron/DTensor 训练后端,vLLM/TRT-LLM/SGLang 生成后端 | 附录 H §H.4.3 |
 
 > 走读纪律(Ch30 §30.2):每个"读过源码"的说法必须能落到**文件 + 方法级**,且带验证它的实验。仓库的 main 分支漂移快——**走读时锁 commit,登记到附录 G**。
 

@@ -192,7 +192,7 @@ class RadixCache:
 | 数据结构 | 定长 16-token block + 哈希表(带父链) | 变长节点基数树 |
 | 命中条件 | 按 block 步长前缀对齐 | 任意长度前缀,天然支持分叉 |
 | 逐出 | 单 block LRU | 子树 LRU |
-| 甜区负载 | 通用(共享 system prompt) | 多轮对话、few-shot、tree-of-thought/多候选、agent 循环(共享主干、分叉探索) |
+| 甜区负载 | 通用(共享 system prompt) | 多轮对话、few-shot、tree-of-thought/多候选、agent 循环(共享主干、分叉探索;负载画像与成本模型见附录 H) |
 
 两者目标相同:**用复用消灭重复 prefill**;差别是"能表达多细的复用"。SGLang 论文报告:高复用负载下端到端最高 ~2-6×(负载相关,复测为准)。
 

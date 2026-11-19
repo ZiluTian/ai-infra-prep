@@ -35,6 +35,7 @@
 | Ch22-23 | vLLM v1.x 监控面 | 监控指纹定性 | |
 | Ch24-27 | 全栈快照 = §24.4 记录表(每实验一张) | **全部实测数据**(70B FP8/FP16,8×H100) | 实测的唯一出处 |
 | Ch28-30 | 无新数据 | 引用 Ch25-27 实测 + Ch17/19 量级 | |
+| 附录 H | 生态/RL 框架(LangGraph / OpenAI Agents SDK / CrewAI / AG2 / LlamaIndex Workflows / sgl-router;verl / OpenRLHF / TRL / SkyRL / NeMo-RL):官方文档/官方 blog 口径,2026-11 核对,**未实机核验** | 无(负载画像为[假设]/[估算];引擎行为复用 §G.5 已验证项) | 同 TRT-LLM 先例:引用处标[官方,未实机核验];实装核验待 4×5090 环境 |
 
 ## G.3 数据归属声明
 
@@ -57,6 +58,7 @@
 | 框架版本 pin(vLLM/SGLang/TRT-LLM 基线) | 发布节奏快,参数名/默认值常变 | Ch4-27 |
 | GenAI-Perf 参数与输出格式 | 工具迭代 | Ch24-27 |
 | Qwen2.5 系模型行为(量化后质量、前缀复用特征) | 模型更新 | Ch25 实验一 |
+| agent 生态与 RL 训练框架版本/API(LangGraph / Agents SDK / verl / SkyRL / NeMo-RL 等,附录 H) | 生态迭代快,API 与默认行为常变 | 附录 H |
 
 **复核状态(2026-11-16,验证机 linuxgpu01:4×RTX 5090 32GB / CUDA 13.0 / Py3.12——非 Ch24-27 的[实测]环境,以下均为验证日志,细节见 §G.5 ③)**:
 ✅ vLLM v0.32.0 实装核验(默认 token 预算 2048 / chunked+prefix 默认开 / kv_role 新取值 / MooncakeConnector / CLI `--help=all` / block 16 / attention=FLASH_ATTN / sampling=FlashInfer JIT),书稿相应修正 7 处(ch04/ch06"默认 8192"→"默认 2048")+ ch27 kv_role 1 处。✅ SGLang v0.5.22 实装核验(disaggregation 旗标 / overlap 默认开 / radix 默认开 + lru 逐出 / evict() 与 Ch5 伪代码一致 / chunked-prefill-size 5090 自动默认 4096 / 源码路径 / `--mem-fraction-static`)——与书一致,无需改书。✅ NCCL 30 项对照(2.29.7:26 一致 / 4 修正 / 1 新增,附录 C §C.7)+ ch18 正文旧变量名修正。✅ B200 规格行(§G.5 ①)。✅ 框架版本 pin(§G.5 ②)。✅ labs 端到端(bench_basics + request_tracer 在 vLLM/SGLang 双真实服务上跑通,§G.5 ③f)。
@@ -82,3 +84,5 @@
 **f) labs 端到端(Qwen3-4B 替代模型,GPU 3,vLLM/SGLang 双真实服务)**:
 - **vLLM**(READY ~70s):bench_basics prompt 256/2048/8192(out=32)→ TTFT 0.023/0.047/0.147s(TTFT 随 prompt 长度近线性增长 = prefill 线性形态 ✓),TPOT 恒 ~0.009–0.013s(decode 恒速 ✓);request_tracer(n=32,并发 8)吞吐 ≈624 tok/s,TTFT p50/p95/p99 = 44/59/60ms,TPOT = 12.44/13.06/13.06ms,ITL p99 = 16.36ms;Prometheus 三段 Δ:queue 0.01ms + prefill 27.96ms + 网络/客户端开销 ≈18ms ≈ 客户端 TTFT 46ms(Ch20 L2 三段分解端到端 ✓)。vLLM 指标名 = `request_queue_time_seconds` / `request_prefill_time_seconds` / `request_decode_time_seconds` / `time_to_first_token_seconds`。
 - **SGLang**(READY ~75s;metrics 取样轮 READY ~28s[JIT 缓存已热]):首 case TTFT 1.865s(JIT 预热),后续 0.016s;prompt 256/2048/8192 → TTFT 0.016/0.029/0.090s;TPOT ~5.7ms(flashinfer decode,快于 vLLM 默认路径);`/metrics` 默认 404,加 `--enable-metrics` 后取样成功(71.6KB):TTFT = `sglang:time_to_first_token_seconds`(histogram),TPOT 等效 = `sglang:request_time_per_output_token_seconds`,三段分解 = `sglang:per_stage_req_latency_seconds` + `sglang:queue_time_seconds`,前缀缓存 = `sglang:cache_hit_rate` / `sglang:cached_tokens_total`,负载/KV = `sglang:num_running_reqs` / `sglang:kv_used_tokens` / `sglang:gen_throughput`。
+
+- **2026-11-19**:⑧ **附录 H 新增(Agent 负载与自我改进)+ `labs/agent_load.py`**:内容口径 = 引擎行为复用 §G.5 已验证事实(vLLM v0.32.0 / SGLang v0.5.22,不重复登记);生态框架(§H.1.1 六项:LangGraph / OpenAI Agents SDK / CrewAI / AG2 / LlamaIndex Workflows / sgl-router)与 RL 训练框架(§H.4.3 五项:verl / OpenRLHF / TRL / SkyRL(NovaSky-AI)/ NeMo-RL(NVIDIA-NeMo/RL))一律 **[官方, 2026-11, 未实机核验]**,不进入 §G.1 基线(§G.2 登记,同 TRT-LLM 先例);公式 (H-1)~(H-5) 的算例为[假设]/[估算],无实测数据。`agent_load.py` 的 `--dry-run` 于 Windows 开发机(Py 3.13)验证:负载构造与 prefill 账正确(η 与附录 H §H.1.2 手算一致:8K system / 10 轮 → η≈86.6%,手算 86.7%);**实服务路径未核验**,待 4×5090 环境按 ③f 口径跑通后补登记。**未做(如实登记):附录 H 全部生态/RL 框架实装核验、`agent_load.py` 实服务端到端。**

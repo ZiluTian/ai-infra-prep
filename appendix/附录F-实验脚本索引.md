@@ -1,9 +1,9 @@
 # 附录 F:实验脚本索引
 
-> `labs/` 仓库现有 7 个可直接运行的脚本(简化实现,与正文公式一一对应)。
+> `labs/` 仓库现有 8 个可直接运行的脚本(简化实现,与正文公式一一对应)。
 > 正文中的"实验"(Ch16-18, Ch25-27)依赖真实 GPU 环境,其**工具与步骤**在对应章节;本附录负责"哪个脚本支撑哪个公式/实验"的映射,以及实验记录的统一模板。
 
-## F.1 labs/ 脚本(7 个)
+## F.1 labs/ 脚本(8 个)
 
 | 脚本 | 支撑内容 | 用法 | 输出 | 关联章节 |
 |---|---|---|---|---|
@@ -14,6 +14,7 @@
 | `comm_planner.py` | TP/PP/EP 每步通信量 | `python comm_planner.py --hidden 8192 --layers 80 --tp 8 --bs 1`;`--ep 8 --topk 8 --batch 64`(MoE) | 每步通信总量/单 op 量 + NVLink 900GB/s 与 IB 50GB/s 两档延迟 + 延迟/带宽主导判读口诀 | Ch13 (13-1)/Ch14 (14-1)(14-2),Ch16 EP 算账,Ch26 实验复用,Ch29 案例 1/5 |
 | `request_tracer.py` | Ch20 L2 分段:per-request 时间戳 + TTFT 三段分解 | `python request_tracer.py --base-url http://localhost:8000/v1 --model qwen2.5-7b --n 32 --concurrency 8 [--metrics http://localhost:8000/metrics]` | ① 每请求 t0/首 token/末 token + TTFT/TPOT/E2E;② p50/p95/p99 分位;③ 接 `--metrics`(vLLM Prometheus)时自动分解服务端排队/prefill/decode 段 → TTFT ≈ 排队 + prefill + 网络 | Ch20 §20.1(L2 插桩),Ch2 §2.3(分位口径) |
 | `nccl_baseline.sh` | Ch18 §18.4 busbw 验收(×0.875,N=8) | `./nccl_baseline.sh --gpus 8`(节点内);`--hostfile nodes.txt`(跨机);`--link-bw/--expected` 覆盖期望值 | all_reduce/alltoallv 的 busbw 曲线(8M→8G)+ 期望对照(节点内 ~780GB/s、跨机 rail ~350GB/s)+ "低于期望 20% → 拓扑/配置问题"判读 | Ch18 §18.4,附录 C(NCCL 变量) |
+| `agent_load.py` | 附录 H 公式 (H-1)/(H-2) 的可执行版 | `python agent_load.py --dry-run --sessions 3 --turns 6`(不发请求,验证负载构造与账目);实服务:`python agent_load.py --model qwen2.5-7b --sessions 4 --turns 8`(需本地 OpenAI 兼容服务) | 多轮会话(共享 system 前缀 + 逐轮 delta + 工具结果),会话内串行 / 跨会话并行;逐轮 TTFT + 冷/热 TTFT 比(前缀缓存生效代理)+ naive/增量 prefill 账(η,复现 H-1) | 附录 H §H.1.2/§H.2.1,Ch5 §5.4(50% 复用对照),Ch2 分位口径 |
 
 **使用纪律**(Ch2 的测量口径同样适用):
 - 脚本输出是**量级估算**,不是实测;引用时必须标注"估算(脚本)"与"实测(GenAI-Perf/nsys)"的区别。
@@ -64,7 +65,8 @@
 
 ## F.4 缺什么、补什么(诚实清单)
 
-截至 2026-11-16,outline 规划的 6 类脚本已全部独立成 `labs/` 脚本(初稿 4 类,后补 2 类),另在评审修订轮补负载生成脚本 `bench_load.py` → **共 7 个,无缺口**:
+截至 2026-11-19,outline 规划的 6 类脚本已全部独立成 `labs/` 脚本(初稿 4 类,后补 2 类),另在评审修订轮补负载生成脚本 `bench_load.py`、2026-11-19 补 agent 负载脚本 `agent_load.py`(附录 H)→ **共 8 个,无缺口**:
 - **插桩脚本**(`request_tracer.py`):per-request t0/首 token/末 token 时间戳 + p50/p95/p99 分位;加 `--metrics` 接服务端 Prometheus 端点后,可分解服务端排队/prefill/decode 段——对应 Ch20 L2 的"TTFT = 排队 + prefill + 网络"三段。
 - **nccl 基线脚本**(`nccl_baseline.sh`):nccl-tests 一键构建 + all_reduce/alltoallv 节点内/跨机运行,输出 busbw 曲线与期望值判读(×0.875,N=8;验收标准 = Ch18 §18.4 的表)。
+- **agent 负载脚本**(`agent_load.py`):多轮会话 + 工具循环的 OpenAI 兼容负载生成;会话内轮次串行、跨会话并行;逐轮 TTFT + 冷/热比 + prefill 账(η)。**诚实登记:2026-11-19 新增,`--dry-run` 已在开发机验证(负载构造与账目,η 与附录 H §H.1.2 手算一致),实服务路径(vLLM/SGLang 端到端)尚未核验**——核验前其输出口径与其余 7 个已核验脚本不等价(附录 G §G.5;核验后按 ③f 口径补登记)。
 > 补脚本的原则(不变):能复现书中**至少一个带数字的结论**才值得写;否则章节内命令块足够。
