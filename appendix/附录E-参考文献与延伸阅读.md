@@ -80,7 +80,8 @@
 | Madaan et al., *Self-Refine: Iterative Refinement with Self-Feedback* (2023) | 生成→自评→精修:每任务 2-3× 调用量;自评 = 长输入短输出 | 附录 H §H.3 |
 | Zhou et al., *STaR: Bootstrapping Reasoning With Reasoning* (2023) | 自训练最简管线:生成→验证筛选→回灌;rollout serving 的起点 | 附录 H §H.4.1 |
 | Yuan et al., *Self-Rewarding Language Models* (2024) | policy 兼任 judge:无额外模型,调用量翻倍,同池资源画像冲突 | 附录 H §H.4.4 |
-| *DeepSeekMath* (2024,提出 GRPO) | group 相对策略优化:同 prompt G rollouts = 前缀分叉 G 叉 | 附录 H §H.4.2/§H.4.5 |
+| [*DeepSeekMath*](https://arxiv.org/html/2402.03300#S4.SS1) (2024,提出 GRPO) | 同 prompt 多条 rollout、组内优势与裁剪目标 | 附录 H §H.4.2/§H.4.5/§H.4.7–§H.4.9 |
+| [*Direct Preference Optimization*](https://arxiv.org/abs/2305.18290) (2023) | 标准离线 DPO：利用已有偏好对，与在线 rollout 训练对照 | 附录 H §H.4.7 |
 | *DAPO* (2025) | 开源 RL 后训练系统口径:rollout 规模与异步管线 | 附录 H §H.4.3 |
 
 ## E.2 文档与官方资料(必读级)

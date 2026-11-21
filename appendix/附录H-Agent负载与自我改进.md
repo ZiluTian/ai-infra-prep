@@ -6,10 +6,10 @@
 
 ## H.0 范围与口径
 
-- **覆盖**:agent 框架生态的"负载发生器"视角、agent 会话的量化负载画像、agent 负载的 serving 配置推导、agent 级自我改进(Reflexion / memory / self-refine)的负载形式、模型级自我训练 / RL 后训练的 rollout serving 成本模型、两种 serving 模式对照。
-- **不覆盖**:框架本身的编排 API 用法(那是框架文档的事);训练算法本身(GRPO/DAPO 的数学);agent 应用设计(提示词工程、工具设计)。
-- **编号**:公式 (H-1)~(H-5),与附录 A §A.1 登记一致;每个公式带一个手算。
-- **可复现**:§H.1.2 / §H.2.1 的账与冷/热 TTFT 画像可用 `labs/agent_load.py` 复现(附录 F §F.1 第 8 个脚本;`--dry-run` 不发请求即可验证负载构造)。
+- **覆盖**:agent 框架生态的"负载发生器"视角、agent 会话的量化负载画像、agent 负载的 serving 配置推导、agent 级自我改进(Reflexion / memory / self-refine)的负载形式、模型级自我训练 / RL 后训练的 rollout serving 成本模型、GRPO 的单步更新流程、两种 serving 模式对照。
+- **不覆盖**:框架本身的编排 API 用法(那是框架文档的事);训练算法的完整推导;agent 应用设计(提示词工程、工具设计)。
+- **编号**:公式 (H-1)~(H-7),与附录 A §A.1 登记一致;每个公式带一个手算。
+- **可复现**:§H.1.2 / §H.2.1 用 `labs/agent_load.py`(实服务待核验);§H.4.9 用 `labs/grpo_mini.py` 在 CPU 上复现 (H-6)/(H-7) 并训练一个玩具策略。两个脚本见附录 F §F.1。
 
 ## H.1 Agent = 新负载类:从 request 到 session
 
@@ -184,6 +184,8 @@ base → ① rollout(用当前策略权重批量生成)→ ② 验证(规则 / r
 
 **对基础设施的关键观察:管线的每一步都是一类独立的推理负载**——① rollout(长 CoT decode,吞吐模式)、② 验证(长输入短输出,§H.3.2 的 judge 形态)、③ 权重同步(I/O 密集,epoch 边界)。RL 后训练的成本大头在①,有官方口径的佐证:NVIDIA NeMo-RL v0.3 官方 blog(2025-08)的 Llama-70B GRPO 步时分解:**总步 147s,其中 generation 84s(57%)、policy 训练 28s [官方]** → generation 是 RL 步的第一成本。
 
+GRPO 如何把 rollout 的分数变成模型权重的更新，见 §H.4.7。
+
 ### H.4.2 为什么 rollout 是推理基础设施问题
 
 **长 CoT decode 的 KV 账**——2026 年推理模型的输出长度已到 16-128K 量级 [假设,主流推理模型口径]:
@@ -274,6 +276,170 @@ t_sync ≈ W_bytes / b_load;overhead = t_sync / t_epoch
 | 权重同步(epoch 边界) | I/O 密集,窗口内停摆 | 节点内 NCCL / 量化权重 / 异步重叠 | Ch18, §H.4.3 |
 | 数据管线(验证/过滤) | CPU / IO,与 GPU 解耦 | 流水化,不占 GPU 关键路径 | Ch2 |
 
+打分、数据校验与权重同步的伪代码见 §H.4.8；可运行的算法实验见 §H.4.9。
+
+### H.4.7 GRPO：从 rollout 奖励到权重更新
+
+**GRPO（Group Relative Policy Optimization，组相对策略优化）**以同一个 prompt 的多条回答为一组。训练程序用同一份策略权重从原 prompt 启动 `G` 条采样序列。每条序列逐 token 生成，以上一步的序列作为上下文，直到生成结束符或达到长度上限。`G` 是训练配置。各条序列可以并行生成，共享 prompt 的前缀缓存，各自维护生成的 token。
+
+> **案例 [假设]：手算一次 GRPO 更新。** 给 `17 × 6 = ?` 采样四条回答，校验器对正确的最终答案给 1 分，对错误答案给 0 分。采样和打分都不更新模型；它们为 trainer 生成训练样本。
+
+| Rollout | 奖励 `rᵢ` | 优势 `Aᵢ` | 策略损失的更新方向 |
+|---|---:|---|---|
+| `60 + 42 = 102` | 1 | +1 | 提高采样 token 在各自上下文中的概率 |
+| `17 × 6 = 112` | 0 | −1 | 降低采样 token 在各自上下文中的概率 |
+| `120 − 18 = 102` | 1 | +1 | 提高采样 token 在各自上下文中的概率 |
+| `17 × 6 = 96` | 0 | −1 | 降低采样 token 在各自上下文中的概率 |
+
+**从分数到优势。** 奖励是绝对得分，优势是相对同 prompt 的组内表现。用总体标准差 `σ` 手算（非零时忽略数值稳定项）：
+
+```text
+Aᵢ = (rᵢ − mean(r)) / σ(r),  σ(r) > 0                 (H-6)
+```
+
+组均值 `(1 + 0 + 1 + 0) / 4 = 0.5`，四个偏差的平方都是 `0.25`，所以 `σ = √0.25 = 0.5`。正确回答的优势为 `(1 − 0.5) / 0.5 = +1`，错误回答为 `(0 − 0.5) / 0.5 = −1`。只有整条回答的奖励时，该回答的所有生成 token 共用一个优势值：校验器知道最终答案是否正确，却不能直接定位哪一步算错。只保留正确回答做 SFT 也是一种做法，但它没有这里对低于组均值样本的负向策略信号。
+
+> **踩坑：平均奖励不等于有效学习信号。** `[0, 0, 0, 0]` 与 `[1, 1, 1, 1]` 的组均值不同，但标准差都为零。下方伪代码为分母加一个小量，两组的优势都为零，因此都不产生**奖励驱动的策略梯度**；若启用参考模型 KL，仍可能有正则梯度。二元奖励下，同时监控平均奖励和**混合奖励组占比**：用同时出现 0 和 1 的完整有效组数除以完整有效组总数；一般标量奖励则看组内方差非零的比例。
+
+**从优势到策略更新。** Trainer 把 `prompt + 已生成的回答` 输入当前模型，在**同一上下文**下重新计算每个采样 token 的 log-probability。旧策略是生成该批样本的策略快照；旧 log-probability 是固定分母。
+
+```text
+ρᵢₜ = exp(log p_current − log p_old)
+Jᵢₜ = min(ρᵢₜ × Aᵢ, clip(ρᵢₜ, 1−ε, 1+ε) × Aᵢ)     (H-7)
+```
+
+**手算 [假设]：**若一个正优势 token 的概率从 `0.10` 升到 `0.13`，则 `ρ = 1.30`。取 `ε = 0.20`、`A = +1`，目标取 `min(1.30, 1.20) = 1.20`；继续抬高该比值不再为这项增加收益。负优势时看相反方向：若 `A = −1`、`ρ = 0.70`，则取 `min(−0.70, −0.80) = −0.80`；继续压低也无额外收益。裁剪的是**训练目标中的贡献**，不是把模型概率硬锁在某个范围。Trainer 最小化负目标，`loss.backward()` 沿当前策略的前向计算图传递梯度，`optimizer.step()` 才真正更新权重。
+
+**PyTorch 风格伪代码（一个 prompt、一次更新）。** `sample_with_logprobs` 从模型的 softmax 分布逐 token 采样，并返回对应的 log-probability。示例使用相同的概率分布来采样和打分，且每条回答至少包含一个 token。
+
+```python
+def response_logprobs(model, prompt_ids, response_ids):
+    tokens = cat([prompt_ids, response_ids])
+    logits = model(tokens[None, :]).logits[0]  # 当前前向计算各层激活
+
+    # 位置 t 的 logits 预测位置 t+1 的 token。
+    start = len(prompt_ids) - 1
+    response_logits = logits[start : start + len(response_ids)]
+    logprobs = log_softmax(response_logits, dim=-1)
+    return logprobs.gather(-1, response_ids[:, None]).squeeze(-1)
+
+
+# 采样阶段：保存旧策略实际采样 token 的 log-probability。
+with no_grad():
+    rollouts = [sample_with_logprobs(model, prompt_ids) for _ in range(group_size)]
+    rewards = tensor([score(prompt_ids, ids) for ids, _ in rollouts], dtype=float32)
+    advantages = (rewards - rewards.mean()) / (rewards.std(correction=0) + 1e-8)
+
+# 训练阶段：从相同的 token 序列重新做有梯度的前向计算。
+optimizer.zero_grad()
+response_losses = []
+for (response_ids, old_lp), advantage in zip(rollouts, advantages):
+    new_lp = response_logprobs(model, prompt_ids, response_ids)
+    ratio = exp(new_lp - old_lp)
+    clipped_ratio = clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+    objective = minimum(ratio * advantage, clipped_ratio * advantage)
+    response_losses.append(-objective.mean())
+
+loss = stack(response_losses).mean()
+loss.backward()
+optimizer.step()
+```
+
+在同步且采样与训练打分一致的情形，第一次更新前 `new_lp` 与 `old_lp` 数值相等，`ratio == 1`，裁剪不生效，但梯度仍可能非零：`old_lp` 是常量，`new_lp` 随当前权重变化。这里仅演示裁剪后的策略损失；原始 GRPO 目标还包含相对参考策略的 KL 惩罚。**旧策略**提供这批数据的概率比基准，**参考策略**提供 KL 锚点，不是同一个角色。[官方：DeepSeekMath §4.1 与算法 1](https://arxiv.org/html/2402.03300#S4.SS1)
+
+| 方法 | 更新信号从哪来 | 对 rollout serving 的影响 |
+|---|---|---|
+| LLM RLHF 中常见的 PPO | 训练 critic 估计给定部分回答时的预期后续回报，再构造 token 优势 | 在线采样，同时承担 critic 训练开销 |
+| GRPO | 同 prompt 多条回答的组内奖励作为优势估计的基础，不训练 critic | 要为同一 prompt 采样多条回答；相对 PPO 没有固定的总算力倍数 |
+| 标准离线 DPO | 利用已有的 chosen/rejected 偏好对 [官方：DPO, 2023](https://arxiv.org/abs/2305.18290) | 优化循环内不需要生成新 rollout；偏好数据仍须事先获得 |
+
+### H.4.8 打分、数据校验与权重同步
+
+下面以同步 GRPO 为例。每条 rollout 记录所属的 `group_id`、prompt、回答、生成 token、这些 token 在采样时的 log-probability，以及生成时的策略版本。每个 `group_id` 对应同一个 prompt 的一组采样。
+
+**1. 奖励打分。** `reward_fn` 读取一条完整回答。规则校验器可以给 `17 × 6` 的答案打 0 或 1 分，reward model 或自评模型也可以为整条回答给出一个标量分数。
+
+```python
+def score_rollouts(rollouts, reward_fn):
+    for rollout in rollouts:
+        rollout.reward = reward_fn(rollout.prompt, rollout.response)
+    return rollouts
+```
+
+**2. 数据校验与分组。** 本例要求每组恰好有 `G` 条记录，使用同一策略快照，并为每个生成 token 保存一个旧 log-probability。组不完整或记录无效时跳过整组。答错但得分有效的样本仍保留在组内，参与组内平均奖励和优势值的计算。
+
+```python
+def prepare_grpo_groups(rollouts, expected_version, group_size):
+    groups = []
+    for group in group_by(rollouts, key="group_id"):
+        if len(group) != group_size:
+            continue
+
+        if any(
+            r.policy_version != expected_version
+            or len(r.response_tokens) == 0
+            or len(r.response_tokens) != len(r.old_logprobs)
+            or not is_finite(r.reward)
+            for r in group
+        ):
+            continue
+
+        groups.append(group)
+    return groups
+```
+
+**3. 权重同步。** Trainer 完成优化器更新后导出快照。同步模式下，所有 rollout worker 确认加载新版本后，下一批采样才开始。
+
+```python
+def sync_rollout_workers(trainer, workers, new_version):
+    snapshot = trainer.export_weights()
+    parallel_for(
+        workers,
+        lambda worker: worker.load_weights(snapshot, version=new_version),
+    )
+    wait_until_all_workers_report_version(workers, new_version)
+```
+
+把三个阶段接回同步训练循环。`trainer.grpo_update` 对各组的已打分样本执行 §H.4.7 的优势值计算、损失计算和权重更新。
+
+```python
+for prompts in prompt_batches:
+    rollouts = generate_rollouts(prompts, G, workers, version)
+    scored = score_rollouts(rollouts, reward_fn)
+    groups = prepare_grpo_groups(scored, version, group_size=G)
+
+    if groups:
+        trainer.grpo_update(groups)
+        sync_rollout_workers(trainer, workers, new_version=version + 1)
+        version += 1
+```
+
+### H.4.9 Mini Lab：在 CPU 上跑一遍 GRPO
+
+**目标。** 亲手复现 §H.4.7 的两个结论：组内奖励无差异时没有策略梯度；第一次更新前概率比为 1，但混合奖励组仍能推动学习。再观察复用旧 rollout 时，裁剪何时生效。
+
+**环境。** CPU + Python 3 标准库；无需 GPU、模型下载、PyTorch 或在线服务。脚本用四道乘法题，每题四个候选答案，每个候选答案相当于一个 token。每题有独立的一行 logits；初始 softmax 均匀，正确答案概率是 `1/4 = 0.25` [假设]。这不是 LLM 训练：没有多 token 信用分配、KL、跨题参数共享或跨进程权重同步。`rollout()` 保存旧 log-probability 并给出优势；`objective_and_grad()` 对同一批样本重算概率比并求解析梯度；`train()` 更新 logits，再用新策略采样。
+
+在仓库根目录运行（Windows 若未配置 `python`，用 `py` 替换）：
+
+```bash
+python labs/grpo_mini.py --self-test
+python labs/grpo_mini.py
+python labs/grpo_mini.py --group-size 1
+python labs/grpo_mini.py --updates-per-batch 1
+```
+
+| 对照 | 看什么 | 怎么解释 |
+|---|---|---|
+| `--self-test` | `PASS` | 复算 `[1, 0, 1, 0] → [+1, −1, +1, −1]`、全同奖励、正负方向裁剪；用有限差分校验解析梯度 |
+| 默认：每题 8 条 rollout、每批更新 4 次、seed 7 | `expected_reward` 在第 20 步从 `0.250` 升至 `0.948`；第 1 批 `clipped_terms` 为 `2.3%` | 复用固定旧 log-probability 的样本后，当前策略开始偏离生成策略，部分项进入裁剪分支 |
+| 只改 `--group-size 1` | `mixed_groups` 始终 `0/4`，`gradient_norm` 为 `0`，`expected_reward` 仍为 `0.250` | 每组只有一个分数，与自身均值相等；即使采样碰巧答对，也不会更新 |
+| 只改 `--updates-per-batch 1` | `clipped_terms` 为 `0%`，但首批 `gradient_norm` 非零 | 每批只在生成该批数据的策略上求一次梯度，裁剪不生效不等于没有学习信号 |
+
+**读数口径。** 表中运行输出为 Windows/Python 3.13 的玩具实验复现记录（附录 G §G.5），不是生产训练或 serving [实测]。`sampled_reward` 是更新前采样得到的平均奖励，会波动；`expected_reward` 是更新后在同四道**训练题**上正确选项的平均概率，不是泛化准确率。`gradient_norm` 只记每批首次更新，`clipped_terms` 则统计该批全部更新中的样本项。
+
+**动手题。** 保持 seed 不变，只把组大小从 8 改成 2，比较前几批 `mixed_groups` 与每批生成的样本数。再想想：若每题要生成的不再是一个 token，而是长 CoT，增加组大小能换来更多有学习信号的组，但会让 rollout 引擎多承担什么成本？回看 §H.4.2 和 §H.4.5。
+
 ## H.5 两种 serving 模式对照(agent 延迟模式 vs RL 吞吐模式)
 
 | 维度 | agent 会话(延迟模式) | RL rollout(吞吐模式) |
@@ -296,11 +462,13 @@ t_sync ≈ W_bytes / b_load;overhead = t_sync / t_epoch
 3. **"估算 1M RL rollouts 的 GPU-hours?"** 公式链:H-3 算 KV/seq(70B GQA 64K FP16 ≈ 20GiB)→ 容量链算并发(480GB 池 → ~24)→ decode 吞吐量级(~4K tok/s @ batch 24)→ 3.2×10¹⁰ tok ÷ 4K tok/s ≈ 2200 GPU-h;prefill 55 h 可忽略(占 2.5%)。结论句:decode 占 >97%,优化只盯 decode。
 4. **"RL 管线里权重同步的开销与风险?"** H-4 手算:NVMe 47 s vs 节点内 NCCL <0.3 s(70B FP16);overhead 取决于部署拓扑(同节点 NCCL → 可忽略;分离走盘 → epoch 边界固定税 5-10%)。风险不是性能,是**正确性**:异步生成跨 epoch = 静默 off-policy(踩坑框),正解 = epoch 标签 + staleness bound。
 5. **"agent 负载与 RL 负载,serving 配置差在哪?"** H.5 表挑三个最大差异:SLO(TTFT p95 vs 无)、路由(会话亲和 vs 不需要)、权重生命周期(固定 vs 每 epoch 换)。收尾:同引擎、参数方向相反,混池必分层。
+6. **"GRPO 平均奖励上升，为什么有效梯度可能反而减少?"** 看组内分布：全对和全错都不给相对奖励信号；平均奖励不能替代混合奖励组占比。先查这两个指标，再决定是否需要调整题目难度或采样配置（§H.4.7）。
 
 ## H.7 数据纪律与版本声明
 
 - **[官方, 2026-11, 未实机核验](附录 G §G.2 登记)**:§H.1.1 生态框架表(LangGraph / OpenAI Agents SDK / CrewAI / AG2 / LlamaIndex Workflows / sgl-router)、§H.4.1 管线口径、§H.4.3 RL 训练框架表(verl / OpenRLHF / TRL / SkyRL / NeMo-RL,含 SkyRL staleness manager 与 NeMo-RL async rollouts / 权重传输 10× / Llama-70B 步时分解等官方 blog 数据)。引用时按"官方口径、未实装核验"表述,不写"我们验证过"。
 - **[假设]**:§H.1.2 / §H.1.3 的画像参数(S/Δ/R/K/τ)、§H.3.1 的 p 与 n 区间、§H.4.2 的 KV 池 480GB(与 Ch29 案例 7 同口径)、§H.4.4 的调用量倍数。
 - **[估算]**:公式 H-2 的 r_prefill、H-3 的容量链结论(24 / 48 并发)、H-4 的同步带宽、§H.4.5 全算例(55h / 2200h / 97.5% / 3 天)。
+- **算法公式与教学算例 (§H.4.7)**：GRPO 按 DeepSeekMath（2024）§4.1，标准离线 DPO 按原论文（2023），为[官方]论文口径，非框架版本验证；(H-6)/(H-7) 的分数与概率均为[假设]，伪代码不代表已运行的训练实验。
 - **复用已验证(附录 G §G.5,不重复登记)**:vLLM v0.32.0 默认行为(prefix 缓存 / chunked prefill / block 16 / 指标名)、SGLang v0.5.22 默认行为(radix + lru / overlap / xgrammar / chunked_prefill_size / disaggregation / 指标名)、双服务 OpenAI 兼容端点可用性。
 - **配套脚本**:`labs/agent_load.py`(附录 F §F.1 第 8 个)——复现 H-1 的账(naive vs 增量 prefill、η)与 H-2 的冷/热 TTFT 比。**诚实登记:2026-11-19 新增,`--dry-run` 已在开发机验证(负载构造与账目逻辑),实服务路径未核验**,待 4×5090 环境跑通后按 §G.5 口径补登记。

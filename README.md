@@ -40,7 +40,7 @@ ai-infra-prep/
 │   ├── 07-PartVII-面试篇.md         # Ch28-30
 │   └── 08-附录与参考资料.md         # 公式速查/硬件表/NCCL 速查/术语表/参考文献/脚本索引/版本基线
 ├── chapters/                        # 正文 30 章(ch01-…ch30,一文件一章)
-├── labs/                            # 可运行实验脚本 8 个
+├── labs/                            # 可运行实验脚本 9 个
 │   ├── bench_basics.py              # TTFT/TPOT/ITL 基础压测(Ch1-2)
 │   ├── bench_load.py                # 实测法负载生成:mixed/prefix50/skew 三画像(Ch25/Ch27)
 │   ├── capacity_planner.py          # 容量链 (3-1)~(3-5)(Ch3/Ch29)
@@ -48,7 +48,8 @@ ai-infra-prep/
 │   ├── comm_planner.py              # TP/PP/EP 通信量(Ch13-14)
 │   ├── request_tracer.py            # per-request 时间戳 + TTFT 分段(Ch20 L2)
 │   ├── nccl_baseline.sh             # nccl-tests busbw 一键基线(Ch18 §18.4)
-│   └── agent_load.py                # agent 多轮会话 + 工具循环负载:TTFT 冷/热比 + prefill 账(附录 H)
+│   ├── agent_load.py                # agent 多轮会话 + 工具循环负载:TTFT 冷/热比 + prefill 账(附录 H)
+│   └── grpo_mini.py                 # CPU 小实验:rollout、组内优势、裁剪与策略更新(附录 H)
 └── appendix/                        # 附录 8 篇
     ├── 附录A-公式速查.md            # 全书编号公式 + 辅助公式 + 常代参数
     ├── 附录B-硬件规格表.md          # A100/H100/H200/B200(B200 行 2026-11-16 已复核)
@@ -66,7 +67,7 @@ ai-infra-prep/
 |---|---|---|
 | 1 | 详细大纲(`outline/`) | ✅ |
 | 2 | 正文 30 章(`chapters/ch01`–`ch30`) | ✅(含 Ch28 全 162 题 A/B/C/D/E + Ch29 十案例 + Ch30) |
-| 3 | 实验脚本(`labs/`,8 个) | ✅(可运行;GPU 实验步骤见 Ch16-18/Ch24-27) |
+| 3 | 实验脚本(`labs/`,9 个) | ✅(可运行;GPU 实验步骤见 Ch16-18/Ch24-27) |
 | 4 | 题库与案例 | ✅(与正文口径已对齐;1M prefill FLOPs 数量级已在 Ch17/Ch28 修正为 7.4×10¹⁶) |
 | 5 | 附录 A–H | ✅(附录 H 2026-11-19 新增) |
 | 6 | 逐章复核框架小版本行为(附录 G §G.4/§G.5) | ✅(2026-11-16,验证机 4×5090;vLLM/SGLang/NCCL 实装核验 + 书稿修正;TRT-LLM 参数名已源码级实证(运行时依赖未齐)、GenAI-Perf/kernel 复测未做,已如实登记) |
@@ -79,6 +80,7 @@ ai-infra-prep/
 
 - **中级路线(3-5 年,12 周)** / **高级路线(5 年+,8 周)**:`outline/00-总览与阅读路线.md`。
 - **只想刷面试**:Ch28(题库)→ Ch29(案例,按章末映射表对照)→ Ch30(表达与流程);附录 A/D/E 随身查,Agent/RL 负载题加查附录 H。
+- **想动手学 GRPO**:从附录 H §H.4.7 的手算开始，再跑 `python labs/grpo_mini.py` 对照 §H.4.9（仅需 CPU 和 Python 标准库）。
 - **数据口径**:全书数字标[实测]/[估算]/[官方]/[假设];实测仅出自 Ch24-27 环境(附录 G §G.1)。
 
 ## 版本基线(写作时须核对并更新附录 G)
