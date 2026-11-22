@@ -17,16 +17,129 @@
 
 2026-11 时点的主流 agent 编排框架(均 **[官方, 2026-11, 未实机核验]**,仓库见附录 E §E.3):
 
-| 框架 | 编排模型 | 与推理引擎的接口 | 对 serving 的负载含义 |
-|---|---|---|---|
-| LangGraph(LangChain 生态) | 图 / 状态机,节点 checkpoint 化 | OpenAI 兼容 `base_url`(provider SDK 可指向任意 OpenAI API 服务) | 图分支 = 前缀分叉;确定性节点 → 到达率较稳 |
-| OpenAI Agents SDK | agent + handoff + guardrail + session | OpenAI 兼容协议;`base_url` 指向任意 OpenAI 兼容服务(即 vLLM/SGLang) | session 对象 → 长生命周期多轮上下文 |
-| CrewAI | 角色化多 agent 流水线(sequential / hierarchical) | 同上 | 流水线串行 → 会话内 burst(agent 交替调用) |
-| AG2(AutoGen 系) | 会话式多 agent(actor 模型) | 同上 | agent 互聊 = 上下文互相引用 → 高前缀复用 |
-| LlamaIndex Workflows | 事件驱动 | 同上 | 事件扇出 → 并发短时 burst |
-| sgl-router(SGLang 官方) | **非编排**:多副本路由器 | 引擎侧(位于 serving 栈内) | cache-aware 路由 = agent 负载的一阶杠杆(§H.2.2) |
+**为什么会有不同形态？** 回到 §H.1.4 的工具调用循环：一次模型请求返回后，总得有人决定“下一步做什么、带哪些状态、到哪里算结束”。如果下一步能预先写出来，普通代码就够了；如果它取决于刚拿到的证据、另一位专家的判断，或几个尚未返回的事件，控制流程就需要不同的表达方式。下面比较的是**常用编排方式及其取舍**。同一个框架可以组合几种方式；一个 agent 通常是一组指令、工具和状态，不等于一份单独部署的模型权重。
 
-**结论(基础设施视角):所有编排框架都走 OpenAI 兼容协议(chat completions),serving 栈面对的是一个协议、多种负载形态。** 框架差异不体现在协议上,而体现在三处:① 到达过程(人 pacing vs 扇出 burst);② 前缀共享结构(单链多轮 vs 树状分叉);③ 会话生命期(分钟级交互 vs 小时级长任务)。vLLM / SGLang 暴露 OpenAI 兼容 `/v1` 端点一事是本书已验证口径(附录 G §G.5 ③f:双真实服务上跑通 `labs/` 全部 HTTP 脚本)。
+| 编排方式（代表例） | 谁决定下一步？适合什么任务？ | 换来的好处与付出的代价 |
+|---|---|---|
+| 单 agent 工具循环（可直接用 SDK 写） | 模型根据当前消息选工具或作答；应用执行、回填并限制轮数。适合工具少、路径不固定的查询。 | 一条消息历史就能追踪全过程。随着工具和历史增加，每轮输入可能变长；模型也可能重复查询，所以要设终止条件。 |
+| 显式图 / 状态机（LangGraph） | 开发者定义节点、允许的边及状态；节点也可以用模型判断走哪条边。适合有审批、重试或中断恢复的流程。 | 能明确记录卡在哪一步，从检查点恢复。代价是维护状态和分支；恢复时还要避免把已完成的外部操作再执行一次。固定边不代表模型输出或耗时固定。 |
+| 专家交接（OpenAI Agents SDK：handoff；另见下文 guardrail） | 当前 agent 将后续对话交给另一位有专用工具和指令的 agent。适合职责边界清楚、事先不知道该找谁的任务。 | 专家只需看到相关工具和上下文；路由选错或交接漏掉关键信息则要返工。交接是否多一次模型调用，取决于路由如何实现。 |
+| 角色流水线（CrewAI） | 预设研究、撰写、复核等职责，按顺序交付产物，或由主管分派任务。适合有明确中间交付物的工作。 | 可以独立检查各阶段产物；依赖上游输出的模型调用必须串行，阶段越多，关键路径越长。简单任务硬拆角色只会多传一遍上下文。 |
+| 会话式多 agent（AG2 / AutoGen 系） | 多个角色通过消息互相质疑、补证，再按终止规则收敛。适合无法预先列出所有追问的协作。 | 能根据反例继续讨论；也可能互相附和或反复争论。要限制轮数、控制谁能看哪些历史，不能把“多一位复核者”当成正确性的保证。 |
+| 事件驱动（LlamaIndex Workflows） | 步骤订阅事件，工具完成后触发下一步；需要多个结果时再汇合。适合慢工具、并行查询和异步回调。 | 独立任务可以重叠等待；代价是处理乱序、重复事件、超时和部分结果。若多个事件同时触发模型请求，下游会短时排队。 |
+
+**Guardrail（运行时检查）放在哪里？** Handoff 决定“交给谁”，guardrail 判断“这一步是否允许继续”。单 agent、状态图和多 agent 都可以在接收输入、执行工具前或返回最终回答前设置检查。例如模型提议 `publish_hike` 时，即使工具参数完全符合 schema，运行时仍要核对领队是否批准了**当前版本**的活动；未批准就保留草稿，请求确认。这里的 guardrail 是一次状态检查，不增加 LLM 调用。若用另一个模型审查回答，则要多算一次推理；若必须等审查通过才能返回，还要计入等待时间（§H.3.2）。
+
+> **案例 [假设]：同一个 MacRitchie 周六徒步助手，该怎么选？** 只问天气时，一个 agent 调天气工具再回答就够了。若产品规定“发布活动前必须由领队确认”，就把“草拟 → 等待审批 → 发布”写成显式状态；领队隔天确认时，恢复的是应用状态，不需要让模型请求挂一晚。如果还要查步道关闭公告，天气和公告互不依赖，普通代码里并行发出两个查询即可；只有当回调、重试和汇合本身变复杂时，事件工作流的额外状态管理才值得。三种做法可以用同一个模型，差别在于任务的依赖关系。
+
+**落到 serving：画一次请求轨迹，再选框架。** 对同一个任务记录模型调用数、输入/输出 token、最长串行依赖链、同时就绪的模型请求数，以及工具等待时间。并行发两个工具请求再一次性汇总，不等于给推理引擎发两次请求；两个角色共享事实，也不等于共享 KV，只有实际 token 前缀一致、缓存仍可命中时才有复用收益。任务越简单，越应从普通函数或单循环开始；出现明确的恢复、隔离或并发需求，再引入相应机制。
+
+协议与编排是两个选择：上述方式都可以围绕同一类模型端点设计，具体工具调用等特性是否兼容要按适配器核对。本书验证过 vLLM / SGLang 的 OpenAI 兼容 `/v1` 端点（附录 G §G.5 ③f）。**sgl-router** 属于另一层：编排器决定“下一项任务是什么”，路由器决定“把已生成的推理请求交给哪个副本”，其缓存局部性取舍见 §H.2.2。
+
+#### 同一个徒步助手，六种控制流程（教学伪代码）
+
+用户输入 `q = "我想这周六去 MacRitchie 徒步"`。下文用 `infer(...)` 表示**一次模型请求**；`forecast` 查天气，`closures` 查步道公告，二者都是由应用执行的工具。每段独立，只展示一种编排方式；函数名用来说明语义，不是可直接运行的框架 API。读代码时留意：**哪一行决定下一步？哪一行真的需要模型？**
+
+**① 单 agent：模型选工具，应用管循环。** 先给模型工具定义，而不是预先替它查天气。若第一轮返回 `forecast` 调用、第二轮返回建议，这条路径就是两次推理夹一次工具调用。
+
+```python
+history = [user(q)]
+for turn in range(4):                         # 教学预算 [假设]
+    reply = infer(history, tools=[forecast.schema, closures.schema])
+    if not reply.tool_calls:
+        return reply.text
+    history.append(reply.as_assistant_message())
+    for call in reply.tool_calls:
+        value = execute_checked(call)         # 应用校验并执行，不是 infer()
+        history.append(tool_result(call.id, value))
+return "达到调用预算，请缩小查询范围"
+```
+
+**② LangGraph 式状态图：暂停在审批节点。** 假设领队要求把建议发布为活动通知。模型只负责草拟；开发者用图的边规定发布前必须审批。审批可能隔天才到，恢复的是保存的业务状态。
+
+```python
+def draft(s):
+    facts = forecast(s.area, s.date)
+    return {"notice": infer([q, facts]).text}       # 写入图状态
+
+def approve(s):
+    decision = interrupt_and_wait_for_leader(s.notice)  # 保存状态，让出执行资源
+    return {"approved": decision.matches_and_approves(s.notice)}
+
+def publish(s):
+    return publish_once(s.notice, key=(s.task_id, digest(s.notice)))
+
+graph = Graph(nodes=[draft, approve, publish], checkpoint_store=db)
+graph.edge(START, draft); graph.edge(draft, approve)
+graph.route(approve, lambda s: publish if s.approved else END)
+graph.edge(publish, END)
+graph.run(initial={"task_id": task_id, "area": "MacRitchie", "date": saturday})
+```
+
+**③ OpenAI Agents SDK 式 handoff：更换负责后续对话的 agent。** 前台可以直接回答一般问题，也可以把徒步问题交给路线专家。交接后由专家继续接收消息；应用显式选择传哪些上下文。这里用一个工具执行前的 guardrail 展示交接与授权的区别。
+
+```python
+front = Agent("前台", handoffs=["路线专家"])
+hike = Agent("路线专家", tools=[forecast, closures, publish_hike])
+session.active = front
+reply = infer([q], agent=front)                    # 可返回 handoff 或普通答复
+if reply.handoff_to == hike.name:
+    session.active = hike
+    context = [user(q), session.date_and_area]     # 显式传递日期、地点和原问题
+    reply = infer(context, agent=hike)
+# 后续用①的循环，但用 session.active 的工具集；分发工具前运行下列检查：
+def before_dispatch(call):
+    if call.name == "publish_hike" and not leader_approved(call.notice_version):
+        return BLOCK("保留草稿，等待领队批准此版本")
+    return ALLOW
+```
+
+**④ CrewAI 式角色流水线：开发者固定交付顺序。** 方案要求“查事实 → 写建议 → 审阅”，即使研究员已能回答原问题，撰写和复核阶段也照常发生。这里让每个角色交付一份具体产物。
+
+```python
+sources = [forecast(area, saturday), closures(area, saturday)]
+facts = infer(sources, role="研究员：列出天气时段和关闭的步道，保留来源")
+plan = infer([q, facts.text], role="撰写者：用证据写出徒步建议")
+review = infer([facts.text, plan.text], role="复核者：逐项检查依据，返回通过或修改意见")
+return plan.text if review.passed else send_to_editor(plan.text, review.comments)
+```
+
+本例在取回数据后必经三次串行推理。换角色可以只换指令、共用同一模型；耗时来自下游必须等上游交付，不是来自加载三个模型。
+
+**⑤ AG2 式多 agent 会话：上一条消息决定是否要再查。** 与固定复核流水线不同，核查员可以提出具体追问；追问和回答都进入对话历史。下面把发言角色固定下来，但讨论何时结束、下一轮查什么取决于消息内容。
+
+```python
+chat = [user(q), tool_message(forecast(area, saturday))]
+for round in range(3):                            # 教学上限 [假设]
+    proposal = infer(chat, role="规划员：据已有证据提出或修订路线")
+    chat.append(message("规划员", proposal.text))
+    check = infer(chat, role="核查员：返回 ACCEPT，或指出缺少哪项证据")
+    if check.kind == "ACCEPT":
+        return proposal.text
+    chat.append(message("核查员", check.question))
+    if check.missing == "步道关闭公告":
+        chat.append(tool_message(closures(area, saturday)))
+return "讨论达到上限，交领队复核"
+```
+
+**⑥ LlamaIndex Workflows 式事件流：结果到齐才汇合。** 天气和步道查询互不依赖，谁先完成都可以。事件带 `task_id`，避免把不同用户的结果拼在一起。只有汇合后的总结步骤需要模型。
+
+```python
+on Start(e):
+    emit(NeedWeather(e.task_id, e.area, e.date))
+    emit(NeedClosures(e.task_id, e.area, e.date))
+
+on NeedWeather(e): emit(Result(e.task_id, "weather", await forecast(e.area, e.date)))
+on NeedClosures(e): emit(Result(e.task_id, "closures", await closures(e.area, e.date)))
+
+on Result(e):
+    store.put(e.task_id, e.kind, e.value)
+    # 按 task_id 原子判断两类结果是否齐备，并确保只触发一次总结。
+    if store.claim_ready_once(e.task_id, required={"weather", "closures"}):
+        emit(Done(e.task_id, infer([question(e.task_id), store.results(e.task_id)]).text))
+```
+
+若公告服务始终没有响应，应让超时事件结束等待，并明确告知“公告未核实”。这里的扇出是两个工具请求，而不是两次 LLM decode。相比之下，④即使没有工具等待，三个角色的推理仍然串行——只数“有几个 agent”推不出延迟。
 
 ### H.1.2 [基础] 会话负载的参数化模型(公式 H-1)
 
