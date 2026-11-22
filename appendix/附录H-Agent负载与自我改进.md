@@ -62,6 +62,10 @@ S = 8K,Δ = 400,R = 600(每轮),K = 10,忽略 A 或视为已并入 Δ:
 
 ### H.1.4 [基础→进阶] 工具调用链：模型提议，运行时执行
 
+**从 next-token prediction 理解工具调用。** 模型仍是同一个函数：输入文本经 tokenizer 变成 token ID，ID 映射成 embedding，模型用权重计算下一 token 的分数；解码器选出一个 token，把它接在前缀后面，再预测下一个。这个循环既能写自然语言，也能写出表示工具调用的 token 序列。**工具调用没改变模型算什么，改变的是应用如何解释生成的 token。**
+
+以查天气为例，应用把 `get_forecast(place_id)` 的名称、用途和参数 schema 随请求送入模型上下文，**不把函数实现交给模型**。支持工具调用的模型通常从训练示例学到：遇到需要外部信息的问题时，可以生成 `get_forecast({"place_id":"ZRH"})` 这样的调用记录，而不是直接作答。解码约束可以帮助输出符合约定格式，但不会执行函数。真正的查询由应用完成；返回的 `{"rain":true}` 被追加为工具消息，在下一次请求中和其他上下文一样被 token 化、映射成 embedding。模型因而能生成“今天有雨”，无需更新权重，也没有一段模型计算暂停等待结果。
+
 **先区分三件事**：模型生成“想调用哪个工具、传什么参数”；推理服务按模型格式解析输出（例如返回 `tool_calls`）；应用或 agent 运行时才负责验证、执行工具、把结果送回模型。普通结构化 JSON 输出也可以只是数据，并不代表应用要执行任何操作。
 
 > **案例 [假设]：查“苏黎世今天会下雨吗？”** 应用随请求声明可用工具及参数 schema，例如 `resolve_place(city: string)` 和 `get_forecast(place_id: string)`。以下是简化消息流，不是某个 SDK 的具体字段格式。
@@ -74,7 +78,62 @@ LLM #2（读到 c1 的结果）→ tool_call c2: get_forecast({"place_id":"ZRH"}
 LLM #3（读到 c2 的结果）→ 最终回答：“今天有雨。”
 ```
 
-**每个箭头发生了什么？** 模型生成工具名和参数，当前 completion 到此结束；运行时等调用记录完整后，检查工具是否在允许列表、参数是否有效、当前用户是否有权执行，再分发给工具。返回时，把 assistant 的调用记录和对应的 tool 结果一起追加到会话，按调用 ID 配对，再发起下一次模型请求。工具超时或失败也应有明确结果；循环在模型给出最终答复或达到调用预算时结束。上例第二个工具依赖第一个工具给出的 `place_id`，所以要串行；如果模型一次提出两个互不依赖的查询，运行时可以并行执行，再把结果汇总给下一次模型请求。
+**“当前 completion 结束”是指推理请求已经返回，不是模型暂停等待。** 对用户来说仍是同一个任务；对推理服务来说，上例有三次独立的请求。以应用自己执行工具的 Chat Completions 风格接口为例，第一轮的边界如下（只展示相关字段）：
+
+1. **应用 → 推理服务：发起请求 #1。** 请求包含用户消息和可用工具的定义。服务将这些内容按模型的聊天模板编码；模型生成的仍是 token，只不过这次 token 表达的是一次工具调用，而不是自然语言答案。
+2. **推理服务 → 应用：返回请求 #1 的 completion。** 服务按模型协议识别调用记录，并把它作为 assistant 消息的 `tool_calls` 返回。例如下面的 `finish_reason: "tool_calls"` 表示这次返回的是调用请求，不是最终答案。流式模式下，名称和参数可能分片到达；收到一段参数不等于可以立即执行，应用要先组装出完整调用，并确认未被截断。具体停止标记和返回字段由模型与接口决定；不是任意一段 JSON 一闭合就自动触发工具。
+
+   ```json
+   {
+     "finish_reason": "tool_calls",
+     "message": {
+       "role": "assistant",
+       "tool_calls": [{"id": "c1", "type": "function", "function": {
+         "name": "resolve_place", "arguments": "{\"city\":\"Zurich\"}"
+       }}]
+     }
+   }
+   ```
+
+3. **应用 → 工具：执行并等待结果。** 应用检查工具允许列表、参数与用户权限，然后运行 `resolve_place`。**等的是应用的任务流程，不是模型。** 这段时间，请求 #1 已完成，不再占用活跃的 decode 槽；引擎仍可能保留可复用的前缀 KV，但不会为了等工具结果继续生成。工具超时或失败时，应用按预算重试、返回错误结果或结束任务，而不是让模型请求一直挂着。
+4. **应用 → 推理服务：发起请求 #2。** 应用保留请求 #1 的 assistant 调用消息，追加 `{"role":"tool","tool_call_id":"c1","content":"{\"place_id\":\"ZRH\"}"}`，再把这些消息与原历史一起发给模型。`tool_call_id` 把结果配回原调用。模型这次能使用 `ZRH`，是因为工具结果成了**新请求的输入**，不是因为旧请求在后台等到了结果。若下一轮没有工具调用并正常返回最终答复，应用就结束循环；也可以用调用次数和时间预算主动停止。
+
+上例第二个工具依赖第一个工具给出的 `place_id`，所以需要再问一次模型。若同一次 completion 已返回两个互不依赖、参数完整的调用，应用可以并行执行，按 ID 分别追加两条结果，再一起发给下一次模型请求。即使 SDK 把整个循环包装成一个 `run()`，执行和等待仍由负责工具编排的运行时承担。
+
+**伪代码：内层预测 token，外层执行工具。** 下例省略流式组装、缓存和并行分发；`infer()` 代表一次模型请求。引擎根据模型协议和停止条件结束生成，解析结果并返回；它不会在生成循环里调用工具。
+
+```python
+# 推理服务：一次 infer() 对应一次 completion。
+def infer(messages, tool_specs):
+    prefix = tokenize(chat_template(messages, tool_specs))
+    generated = []
+    while not stop_reached(generated):  # 模型协议的结束条件或生成长度上限
+        scores = model_next_token_scores(prefix + generated)
+        generated.append(select_token(scores))  # 若启用 grammar，在此限制合法 token
+    return parse_completion(generated)  # 普通回答、完整工具调用，或截断/解析失败
+
+
+# 应用：只把工具定义交给模型；工具实现留在应用的注册表里。
+async def answer(question, tool_specs, tool_registry, max_model_calls, tool_timeout):
+    messages = [{"role": "user", "content": question}]
+    for _ in range(max_model_calls):
+        reply = await inference_client.infer(messages, tool_specs)  # 每轮都是新请求
+        if reply.incomplete:
+            return error("模型输出截断或无法解析")
+        if not reply.tool_calls:
+            return reply.text  # 这时才有给用户的最终回答
+
+        messages.append(reply.assistant_message)  # 保留工具名、参数和调用 ID
+        for call in reply.tool_calls:
+            # 校验工具名、参数和权限；超时或失败时返回结构化错误结果。
+            result = await execute_checked(call, tool_registry, timeout=tool_timeout)
+            messages.append({"role": "tool", "tool_call_id": call.id,
+                             "content": serialize(result)})
+        # 回到循环顶部：工具结果成为下一次 infer() 的输入。
+    return error("已达到模型调用预算")
+```
+
+注意两处 `await` 的区别：第一次等**模型返回调用记录**；第二次等**工具返回结果**。走到第二处时，前一次 `infer()` 已经返回，没有任何模型生成在等待这个工具。
 
 **grammar 只约束生成，不执行工具。** 工具参数可由模型按约定格式生成、再由 parser 提取；若当前 API 模式启用了 grammar 约束，则在每个解码步按“已生成前缀 + 语法状态”过滤不能合法续写的 token。比如期望 `place_id` 为字符串时，会屏蔽将该值写成裸数字的续写。即便返回了完整且符合所支持 schema 的参数，也无法保证 `"ZRH"` 存在、用户有权限或查询会成功；截断的输出也不能当成完整调用。是否启用约束、约束覆盖哪些部分，取决于模型、API 模式和服务配置。SGLang 的 `grammar_backend='xgrammar'` 为默认配置 **[已验证，附录 G §G.5 ③b]**，这不等于每个工具请求都启用了 grammar。约束本身也不要求 greedy、低温度或 `beam = 1`；多候选需要为各自前缀维护语法状态，具体搜索模式是否支持由后端决定。
 
