@@ -100,24 +100,51 @@ LLM #3（读到 c2 的结果）→ 最终回答：“今天有雨。”
 
 上例第二个工具依赖第一个工具给出的 `place_id`，所以需要再问一次模型。若同一次 completion 已返回两个互不依赖、参数完整的调用，应用可以并行执行，按 ID 分别追加两条结果，再一起发给下一次模型请求。即使 SDK 把整个循环包装成一个 `run()`，执行和等待仍由负责工具编排的运行时承担。
 
-**伪代码：内层预测 token，外层执行工具。** 下例省略流式组装、缓存和并行分发；`infer()` 代表一次模型请求。引擎根据模型协议和停止条件结束生成，解析结果并返回；它不会在生成循环里调用工具。
+**内层循环：模型打分，解码器选 token。** 给定当前前缀，Transformer 得到最后一个位置的隐向量 `h`，输出层（LM head）把它映射为长度等于词表大小的向量 `logits`。候选 token 在哪里？就在向量的下标里：`logits[42]` 是词表中 ID 为 42 的 token 作为下一步的原始分数。分数可以为负，总和不必等于 1。贪心解码只需取最大分数的下标；随机采样才需要把分数变成概率。
+
+**手算一轮 [假设]。** 假设正在生成 `{"rain":` 后面的值，schema 要求它是布尔值。为便于手算，设词表里只有下列三个候选，每个候选恰好是一个 token。启用 grammar，温度 `T = 1`，不做 top-k/top-p 过滤：
+
+| 候选 token 的文本 | 模型给出的 logit | 应用 grammar mask 后 | softmax 概率 |
+|---|---:|---:|---:|
+| `"yes"`（含引号） | 3 | −∞ | 0% |
+| `true` | 2 | 2 | ≈73.1% |
+| `false` | 1 | 1 | ≈26.9% |
+
+模型最偏好 `"yes"`，但这是字符串。解码器把它的分数设为 `−∞`，因为 `exp(−∞) = 0`，它就不会被选中。此时贪心一定选 `true`；若采样，`P(true) = exp(2)/(exp(2) + exp(1)) ≈ 0.731`，仍有机会选到 `false`。若降低温度（保持 `T > 0`），`softmax(logits / T)` 会使概率更集中于高分 token。**模型决定偏好，grammar 决定哪些续写合法，解码配置决定怎样选。** grammar 不能判断当地是否真的下雨。
+
+**伪代码：内层预测 token，外层执行工具。** 下例省略流式组装、缓存和并行分发；`infer()` 代表一次模型请求。grammar 状态属于当前生成序列。选中 token 后要推进状态：例如生成 `true` 前需要一个布尔值，生成后则可能允许 `}` 结束对象。实际分词器可能把一个值切为多个 token，状态也要跟踪尚未写完的值。
 
 ```python
 # 推理服务：一次 infer() 对应一次 completion。
-def infer(messages, tool_specs):
+def infer(messages, tool_specs, config):
     prefix = tokenize(chat_template(messages, tool_specs))
+    grammar = init_grammar(config, tool_specs)  # 未启用约束则返回 None
     generated = []
     while not stop_reached(generated):  # 模型协议的结束条件或生成长度上限
-        scores = model_next_token_scores(prefix + generated)
-        generated.append(select_token(scores))  # 若启用 grammar，在此限制合法 token
+        logits = model.next_token_logits(prefix + generated)  # 形状：[词表大小]
+        if grammar is not None:
+            allowed = grammar.allowed_next_token_ids()
+            logits[ids_not_in(allowed)] = -inf
+
+        if config.greedy:
+            token_id = argmax(logits)
+        else:
+            probs = softmax(logits / config.temperature)  # 采样分支 T > 0
+            # 可选：top-k 保留前 k 项；top-p 保留累计概率达到 p 的最小高概率集合。
+            probs = filter_and_renormalize(probs, config.top_k, config.top_p)
+            token_id = categorical_sample(probs)  # 按概率抽一个 token ID
+
+        generated.append(token_id)
+        if grammar is not None:
+            grammar.advance(token_id)  # 下一步据此重新计算合法集合
     return parse_completion(generated)  # 普通回答、完整工具调用，或截断/解析失败
 
 
 # 应用：只把工具定义交给模型；工具实现留在应用的注册表里。
-async def answer(question, tool_specs, tool_registry, max_model_calls, tool_timeout):
+async def answer(question, tool_specs, tool_registry, max_model_calls, tool_timeout, config):
     messages = [{"role": "user", "content": question}]
     for _ in range(max_model_calls):
-        reply = await inference_client.infer(messages, tool_specs)  # 每轮都是新请求
+        reply = await inference_client.infer(messages, tool_specs, config)  # 每轮都是新请求
         if reply.incomplete:
             return error("模型输出截断或无法解析")
         if not reply.tool_calls:
